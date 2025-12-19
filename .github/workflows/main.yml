@@ -1,0 +1,155 @@
+name: 同步OK分支
+
+on:
+  schedule:
+    - cron: '0 16 * * *'  # 每天北京时间0点
+  workflow_dispatch:
+    inputs:
+      force_method:
+        description: '同步方法'
+        required: false
+        default: 'shallow'
+        type: choice
+        options:
+          - shallow
+          - api
+          - full
+
+env:
+  UPSTREAM_REPO: lystv/fmapp
+  TARGET_BRANCH: ok
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30  # 设置整体超时时间
+    
+    steps:
+    - name: 方法1 - 浅克隆同步（推荐）
+      if: github.event.inputs.force_method == 'shallow' || github.event.inputs.force_method == ''
+      run: |
+        echo "使用浅克隆方法同步..."
+        
+        # 创建临时目录
+        mkdir -p /tmp/sync_work
+        cd /tmp/sync_work
+        
+        # 初始化空仓库
+        git init
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        
+        # 添加上游远程（使用深度1）
+        git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+        
+        # 获取上游分支（只获取最新提交）
+        echo "正在获取上游分支..."
+        git fetch --depth 1 upstream ${{ env.TARGET_BRANCH }}
+        
+        # 推送到自己的仓库
+        echo "正在推送到自己的仓库..."
+        git push --force https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git upstream/${{ env.TARGET_BRANCH }}:refs/heads/${{ env.TARGET_BRANCH }}
+        
+        echo "✅ 浅克隆同步完成"
+        
+        # 记录提交信息
+        COMMIT_SHA=$(git rev-parse upstream/${{ env.TARGET_BRANCH }})
+        echo "同步到提交: ${COMMIT_SHA:0:8}"
+        
+        # 清理
+        cd /
+        rm -rf /tmp/sync_work
+
+    - name: 方法2 - API同步（超轻量）
+      if: github.event.inputs.force_method == 'api'
+      run: |
+        echo "使用API方法同步..."
+        
+        # 获取上游最新提交SHA
+        UPSTREAM_SHA=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/branches/${{ env.TARGET_BRANCH }}" | \
+          jq -r '.commit.sha')
+        
+        echo "上游最新提交SHA: $UPSTREAM_SHA"
+        
+        # 使用GitHub API直接更新引用
+        RESPONSE=$(curl -s -X PATCH \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/${{ env.TARGET_BRANCH }}" \
+          -d "{\"sha\": \"$UPSTREAM_SHA\", \"force\": true}")
+        
+        # 检查响应
+        if echo "$RESPONSE" | jq -e '.ref' > /dev/null 2>&1; then
+          echo "✅ API同步完成"
+        else
+          echo "❌ API同步失败"
+          echo "响应: $RESPONSE"
+          exit 1
+        fi
+
+    - name: 方法3 - 完整同步
+      if: github.event.inputs.force_method == 'full'
+      run: |
+        echo "使用完整同步方法..."
+        
+        # 创建工作目录
+        mkdir -p /tmp/full_sync
+        cd /tmp/full_sync
+        
+        # 配置Git
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git config --global http.postBuffer 524288000
+        git config --global core.compression 0
+        
+        # 浅克隆自己的仓库（仅ok分支）
+        echo "正在克隆自己的仓库..."
+        git clone --depth 1 --branch ${{ env.TARGET_BRANCH }} \
+          https://github.com/${{ github.repository }}.git repo
+        cd repo
+        
+        # 添加上游
+        git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+        
+        # 获取上游更新
+        echo "正在获取上游更新..."
+        git fetch upstream ${{ env.TARGET_BRANCH }} --depth=1
+        
+        # 强制重置
+        echo "正在重置分支..."
+        git reset --hard upstream/${{ env.TARGET_BRANCH }}
+        
+        # 强制推送
+        echo "正在推送..."
+        git push --force origin ${{ env.TARGET_BRANCH }}
+        
+        echo "✅ 完整同步完成"
+        
+        # 清理
+        cd /
+        rm -rf /tmp/full_sync
+
+    - name: 验证同步结果
+      run: |
+        echo "验证同步结果..."
+        
+        # 获取本地最新提交
+        LOCAL_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/branches/${{ env.TARGET_BRANCH }}")
+        LOCAL_SHA=$(echo "$LOCAL_INFO" | jq -r '.commit.sha')
+        
+        # 获取上游最新提交
+        UPSTREAM_INFO=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/branches/${{ env.TARGET_BRANCH }}")
+        UPSTREAM_SHA=$(echo "$UPSTREAM_INFO" | jq -r '.commit.sha')
+        
+        echo "本地提交: ${LOCAL_SHA:0:8}"
+        echo "上游提交: ${UPSTREAM_SHA:0:8}"
+        
+        if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
+          echo "✅ 同步验证成功：分支已同步到最新"
+        else
+          echo "❌ 同步验证失败：提交不匹配"
+          echo "可能需要重新运行同步"
+          exit 1
+        fi
